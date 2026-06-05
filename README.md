@@ -47,15 +47,27 @@ baseline/
     types.py              # Bay, Block dataclasses
 ```
 
-## Results
+## Results — 20/20 training instances feasible (8s timelimit each)
 
-| Instance | Blocks | Baseline | ShipScheduler | Improvement |
-|---|---|---|---|---|
-| hard_2bay_60_tight | 60 | **INFEASIBLE** | **1,662,274** | ✗ (baseline fails) |
-| hard_2bay_100_tight | 100 | **INFEASIBLE** | **3,411,915** | ✗ (baseline fails) |
-| example_B2_b10 | 10 | **INFEASIBLE** | **1,056** | ✗ (baseline fails) |
+| Inst | Objective | Time | Inst | Objective | Time |
+|------|-----------|------|------|-----------|------|
+|  1 |  395,047,686 | 7.6s | 11 |  637,844,731 | 6.2s |
+|  2 |  246,841,612 | 7.6s | 12 |  590,059,510 | 6.2s |
+|  3 |  240,358,922 | 7.5s | 13 |  819,908,459 | 6.3s |
+|  4 |  305,685,968 | 7.5s | 14 |  761,721,777 | 6.4s |
+|  5 |  316,593,270 | 7.6s | 15 |  606,563,665 | 6.3s |
+|  6 |  642,585,506 | 6.1s | 16 |  364,103,075 | 6.3s |
+|  7 |  365,829,277 | 6.1s | 17 |  557,390,898 | 6.4s |
+|  8 |  273,794,137 | 6.1s | 18 |  820,564,493 | 6.4s |
+|  9 |  467,884,070 | 6.3s | 19 |  608,110,220 | 6.4s |
+| 10 |  372,789,048 | 6.3s | 20 | 1,358,367,398 | 6.4s |
+| **Total** |         | **131.8s** | | | |
 
-Baseline fails because Shapely `find_earliest_slot` + repair creates unrecoverable crane-path violations. Our `empty_bay_entry` approach is conservative but always valid.
+All 20 training instances (100–300 blocks, 2–5 bays with complex polygon shapes) produce feasible solutions. Average wall time ~6.6s/instance.
+
+Key fixes:
+- **Bounding-box-aware positioning**: blocks whose shape extends left/down from the reference point are shifted so the bounding rect starts at (0,0) using `ceil(max(0, -local_min))`.
+- **LNS position perturbation**: 15% of iterations try random positions/orientations, not just bay/time swaps.
 
 ## Built With
 
@@ -78,4 +90,4 @@ python3 myalgorithm.py   # or import via alg_tester
 
 ## Status
 
-Ready for prelim. The improvement phase (LNS/refine) needs real competition instances to tune — synthetic rectangles don't stress the geometry engine. After June 15 we'll profile on 100–500 block instances and rebuild the metaheuristic.
+**20/20 training instances feasible** in under 8s each (total 132s). Submitted zip verified with `alg_tester`. Tuning LNS/refine for better objective improvement on larger instances after June 15 instance release.
