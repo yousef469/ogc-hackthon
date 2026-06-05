@@ -1,10 +1,12 @@
 from __future__ import annotations
+import math
 import random
 import time
 
 from utils import Bay, Block, check_feasibility
 from config import Config
 from construction.helpers import build_operations, block_bbox, empty_bay_entry
+from construction.repair import _valid_x_range, _valid_y_range, _candidate_positions
 from improvement.acceptance import SimulatedAnnealing
 from core.objective import fast_objective
 
@@ -98,32 +100,51 @@ def run_lns(
         orig_y = a.get("y", 0)
         orig_oi = a.get("orient_idx", 0)
 
-        for bay_id in bay_order:
-            bay = bays[bay_id]
-            bb = block_bbox(blk_data, orig_oi)
-            bw = bb[2] - bb[0]
-            bh = bb[3] - bb[1]
-            if bw > bay.width + 1e-6 or bh > bay.height + 1e-6:
-                continue
-            if bay_id != old_bay:
-                if orig_x + bw > bay.width + 1e-6 or orig_y + bh > bay.height + 1e-6:
+        explore = rng.random() < 0.15
+        if not explore:
+            for bay_id in bay_order:
+                bay = bays[bay_id]
+                bb = block_bbox(blk_data, orig_oi)
+                bw = bb[2] - bb[0]
+                bh = bb[3] - bb[1]
+                if bw > bay.width + 1e-6 or bh > bay.height + 1e-6:
                     continue
-                test_blk = Block(
-                    block_id=bid, block_data=blk_data,
-                    x=orig_x, y=orig_y, orient_idx=orig_oi,
-                )
-                if not bay.contains_block(test_blk):
-                    continue
-            entry = empty_bay_entry(bay_schedule[bay_id], r_time, proc)
-            if entry is not None:
-                tardy = max(0, entry + proc - blk_data["due_date"])
-                pref_penalty = max(prefs) - prefs[bay_id]
-                score = tardy * w1 + pref_penalty * w3
-                if score < best_score:
-                    best_score = score
-                    best_fit = (bay_id, orig_x, orig_y, orig_oi, entry, entry + proc)
-                    if score == 0:
-                        break
+                if bay_id != old_bay:
+                    if orig_x + bw > bay.width + 1e-6 or orig_y + bh > bay.height + 1e-6:
+                        continue
+                entry = empty_bay_entry(bay_schedule[bay_id], r_time, proc)
+                if entry is not None:
+                    tardy = max(0, entry + proc - blk_data["due_date"])
+                    pref_penalty = max(prefs) - prefs[bay_id]
+                    score = tardy * w1 + pref_penalty * w3
+                    if score < best_score:
+                        best_score = score
+                        best_fit = (bay_id, orig_x, orig_y, orig_oi, entry, entry + proc)
+                        if score == 0:
+                            break
+        else:
+            for bay_id in bay_order:
+                bay = bays[bay_id]
+                for oi in range(len(blk_data["shape"])):
+                    bb = block_bbox(blk_data, oi)
+                    xr = _valid_x_range(bay.width, bb)
+                    yr = _valid_y_range(bay.height, bb)
+                    if xr[0] > xr[1] or yr[0] > yr[1]:
+                        continue
+                    px = rng.randint(xr[0], xr[1])
+                    py = rng.randint(yr[0], yr[1])
+                    entry = empty_bay_entry(bay_schedule[bay_id], r_time, proc)
+                    if entry is not None:
+                        tardy = max(0, entry + proc - blk_data["due_date"])
+                        pref_penalty = max(prefs) - prefs[bay_id]
+                        score = tardy * w1 + pref_penalty * w3
+                        if score < best_score:
+                            best_score = score
+                            best_fit = (bay_id, px, py, oi, entry, entry + proc)
+                            if score == 0:
+                                break
+                if best_fit and best_score == 0:
+                    break
 
         if best_fit is None:
             best_fit = (old_bay, a.get("x", 0), a.get("y", 0),

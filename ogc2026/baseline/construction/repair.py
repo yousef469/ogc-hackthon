@@ -1,10 +1,8 @@
-from __future__ import annotations
+import math
 import time
-from typing import Optional
 
 from utils import Bay, Block, check_feasibility
-from construction.helpers import build_operations, empty_bay_entry
-from construction.greedy import greedy_place_blocks
+from construction.helpers import build_operations, empty_bay_entry, block_bbox
 
 
 def repair_greedy(
@@ -18,6 +16,8 @@ def repair_greedy(
     timelimit: float,
     max_passes: int = 10,
 ) -> dict[int, dict]:
+    from construction.greedy import greedy_place_blocks
+
     repaired_counts: dict[int, int] = {}
     forced_ids: set[int] = set()
 
@@ -102,58 +102,134 @@ def repair_greedy(
     return assignments
 
 
+def _valid_x_range(bay_width: float, bb: tuple) -> tuple[int, int]:
+    local_min_x, _, local_max_x, _ = bb
+    min_x = math.ceil(max(0.0, -local_min_x + 1e-9))
+    max_x = math.floor(bay_width - local_max_x - 1e-9)
+    if min_x > max_x:
+        return (0, -1)
+    return (min_x, max_x)
+
+
+def _valid_y_range(bay_height: float, bb: tuple) -> tuple[int, int]:
+    _, local_min_y, _, local_max_y = bb
+    min_y = math.ceil(max(0.0, -local_min_y + 1e-9))
+    max_y = math.floor(bay_height - local_max_y - 1e-9)
+    if min_y > max_y:
+        return (0, -1)
+    return (min_y, max_y)
+
+
+def _candidate_positions(xr: tuple[int, int], yr: tuple[int, int]) -> list[tuple[int, int]]:
+    xmin, xmax = xr
+    ymin, ymax = yr
+    pos = [(xmin, ymin)]
+    if xmax > xmin:
+        pos.append((xmax, ymin))
+    if ymax > ymin:
+        pos.append((xmin, ymax))
+    if xmax > xmin and ymax > ymin:
+        pos.append((xmin + (xmax - xmin) // 2, ymin + (ymax - ymin) // 2))
+    return pos
+
+
 def repair_simple(
     prob_info: dict,
     assignments: dict[int, dict],
     bays: list[Bay],
     blocks_data: list[dict],
+    max_passes: int = 20,
 ) -> dict[int, dict]:
-    from utils import check_feasibility
+    for pass_idx in range(max_passes):
+        sol = {"operations": build_operations(list(assignments.values()))}
+        result = check_feasibility(prob_info, sol)
+        if result["feasible"]:
+            return assignments
 
-    sol = {"operations": build_operations(list(assignments.values()))}
-    result = check_feasibility(prob_info, sol)
-    if result["feasible"]:
-        return assignments
+        viols = result["violations"]
+        to_repair: list[int] = []
+        seen: set[int] = set()
+        for v in viols:
+            try:
+                bid = int(v.split("block ")[1].split()[0])
+                if bid not in seen:
+                    seen.add(bid)
+                    to_repair.append(bid)
+            except (IndexError, ValueError):
+                pass
 
-    viols = result["violations"]
-    to_repair: list[int] = []
-    seen: set[int] = set()
-    for v in viols:
-        try:
-            bid = int(v.split("block ")[1].split()[0])
-            if bid not in seen:
-                seen.add(bid)
-                to_repair.append(bid)
-        except (IndexError, ValueError):
-            pass
+        if not to_repair:
+            return assignments
 
-    n_bays = len(bays)
-    bay_schedule: list[list[tuple[int, int]]] = [[] for _ in range(n_bays)]
-    for a in assignments.values():
-        bay_schedule[a["bay_id"]].append((a["entry_time"], a["exit_time"]))
+        n_bays = len(bays)
+        bay_schedule: list[list[tuple[int, int]]] = [[] for _ in range(n_bays)]
+        for a in assignments.values():
+            bay_schedule[a["bay_id"]].append((a["entry_time"], a["exit_time"]))
 
-    for bid in to_repair:
-        a = assignments[bid]
-        bay_id = a["bay_id"]
-        r_time = blocks_data[bid]["release_time"]
-        proc = blocks_data[bid]["processing_time"]
+        for bid in to_repair:
+            a = assignments[bid]
+            r_time = blocks_data[bid]["release_time"]
+            proc = blocks_data[bid]["processing_time"]
+            prefs = blocks_data[bid]["bay_preferences"]
+            n_o = len(blocks_data[bid]["shape"])
 
-        old_slot = (a["entry_time"], a["exit_time"])
-        if old_slot in bay_schedule[bay_id]:
-            bay_schedule[bay_id].remove(old_slot)
+            old_slot = (a["entry_time"], a["exit_time"])
+            for bj_list in bay_schedule:
+                if old_slot in bj_list:
+                    bj_list.remove(old_slot)
+                    break
 
-        entry = empty_bay_entry(bay_schedule[bay_id], r_time, proc)
-        exit_t = entry + proc
+            best = None
+            for bj in sorted(range(n_bays), key=lambda j: prefs[j], reverse=True):
+                bay = bays[bj]
+                for oi in range(n_o):
+                    bb = block_bbox(blocks_data[bid], oi)
+                    xr = _valid_x_range(bay.width, bb)
+                    yr = _valid_y_range(bay.height, bb)
+                    if xr[0] > xr[1] or yr[0] > yr[1]:
+                        continue
+                    for px, py in _candidate_positions(xr, yr):
+                        entry = empty_bay_entry(bay_schedule[bj], r_time, proc)
+                        if entry is not None:
+                            best = (bj, px, py, oi, int(entry), int(entry + proc))
+                            break
+                    if best:
+                        break
+                if best:
+                    break
 
-        x, y, oi = a["x"], a["y"], a["orient_idx"]
-        if result["stage"] == 4:
-            x, y = 0, 0
+            if not best:
+                bj = max(range(n_bays), key=lambda j: prefs[j])
+                bay = bays[bj]
+                found = False
+                for oi in range(n_o):
+                    bb = block_bbox(blocks_data[bid], oi)
+                    xr = _valid_x_range(bay.width, bb)
+                    yr = _valid_y_range(bay.height, bb)
+                    if xr[0] > xr[1] or yr[0] > yr[1]:
+                        continue
+                    step = max(5, int(min(xr[1] - xr[0], yr[1] - yr[0]) ** 0.5) + 1)
+                    for px in range(xr[0], xr[1] + 1, step):
+                        for py in range(yr[0], yr[1] + 1, step):
+                            entry = empty_bay_entry(bay_schedule[bj], r_time, proc)
+                            if entry is not None:
+                                best = (bj, px, py, oi,
+                                        int(entry), int(entry + proc))
+                                found = True
+                                break
+                        if found:
+                            break
+                    if found:
+                        break
+                if not found:
+                    entry = empty_bay_entry(bay_schedule[bj], r_time, proc)
+                    best = (bj, 0, 0, 0, int(entry), int(entry + proc))
 
-        assignments[bid] = dict(
-            a, x=x, y=y, orient_idx=oi,
-            entry_time=int(round(entry)),
-            exit_time=int(round(exit_t)),
-        )
-        bay_schedule[bay_id].append((entry, exit_t))
+            bj, px, py, oi, entry, exit_t = best
+            assignments[bid] = dict(
+                a, bay_id=bj, x=px, y=py, orient_idx=oi,
+                entry_time=entry, exit_time=exit_t,
+            )
+            bay_schedule[bj].append((entry, exit_t))
 
     return assignments

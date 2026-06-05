@@ -7,9 +7,8 @@ from typing import Optional
 from utils import Bay, Block, check_feasibility
 from config import Config
 from construction.strategies import ALL_STRATEGIES
-from construction.greedy import run_greedy
+from construction.helpers import build_operations, empty_bay_entry, block_bbox
 from construction.repair import repair_simple
-from construction.helpers import build_operations
 from improvement.lns import run_lns
 from improvement.parallel import run_parallel_lns
 from improvement.refine import refine_solution
@@ -28,9 +27,62 @@ def solve(prob_info: dict, timelimit: float = 60.0) -> dict:
     w3 = weights.get("w3", 1.0)
 
     bays = [Bay.from_dict(d, i) for i, d in enumerate(bays_data)]
+    n_bays = len(bays)
 
     best_assignments = None
     best_objective = float("inf")
+
+    def fast_construct(block_order: list[int]) -> dict[int, dict]:
+        assigns: dict[int, dict] = {}
+        bay_sched: list[list] = [[] for _ in range(n_bays)]
+        for bi in block_order:
+            blk = blocks_data[bi]
+            r_time = blk["release_time"]
+            proc = blk["processing_time"]
+            prefs = blk["bay_preferences"]
+            n_o = len(blk["shape"])
+            best = None
+            best_score = float("inf")
+            for bj in sorted(range(n_bays), key=lambda j: prefs[j], reverse=True):
+                bay = bays[bj]
+                for oi in range(n_o):
+                    bb = block_bbox(blk, oi)
+                    bw = bb[2] - bb[0]
+                    bh = bb[3] - bb[1]
+                    if bw > bay.width + 1e-6 or bh > bay.height + 1e-6:
+                        continue
+                    px = math.ceil(max(0.0, -bb[0] + 1e-9))
+                    py = math.ceil(max(0.0, -bb[1] + 1e-9))
+                    if px + bw > bay.width + 1e-6 or py + bh > bay.height + 1e-6:
+                        continue
+                    entry = empty_bay_entry(bay_sched[bj], r_time, proc)
+                    if entry is not None:
+                        tardy = max(0, entry + proc - blk["due_date"])
+                        score = tardy * w1 + (max(prefs) - prefs[bj]) * w3
+                        if score < best_score:
+                            best_score = score
+                            best = (bj, px, py, oi, int(entry), int(entry + proc))
+                            break
+                if best and best_score == 0:
+                    break
+            if not best:
+                bj = max(range(n_bays), key=lambda j: prefs[j])
+                bay = bays[bj]
+                bb = block_bbox(blk, 0)
+                bw = bb[2] - bb[0]
+                bh = bb[3] - bb[1]
+                px = math.ceil(max(0.0, -bb[0] + 1e-9))
+                py = math.ceil(max(0.0, -bb[1] + 1e-9))
+                if px + bw > bay.width + 1e-6 or py + bh > bay.height + 1e-6:
+                    px, py = 0, 0
+                entry = empty_bay_entry(bay_sched[bj], r_time, proc)
+                best = (bj, px, py, 0, int(entry), int(entry + proc))
+            bj, px, py, oi, entry, exit_t = best
+            bay_sched[bj].append((entry, exit_t))
+            assigns[bi] = {"block_id": bi, "bay_id": bj,
+                           "x": px, "y": py, "orient_idx": oi,
+                           "entry_time": entry, "exit_time": exit_t}
+        return assigns
 
     strategy_time = config.get_construction_time(timelimit)
     strategies_to_try = list(ALL_STRATEGIES.keys())
@@ -40,10 +92,8 @@ def solve(prob_info: dict, timelimit: float = 60.0) -> dict:
             break
 
         strat_start = time.time()
-        assignments, bay_placed, bay_schedule, bay_loads = run_greedy(
-            blocks_data, bays, w1, w2, w3,
-            strategy=strategy,
-        )
+        block_order = ALL_STRATEGIES[strategy](blocks_data)
+        assignments = fast_construct(block_order)
 
         sol = {"operations": build_operations(list(assignments.values()))}
 
@@ -63,11 +113,9 @@ def solve(prob_info: dict, timelimit: float = 60.0) -> dict:
 
     if best_assignments is None:
         print(f"[Solver] No feasible construction, falling back to EDD")
-        assignments, *_ = run_greedy(blocks_data, bays, w1, w2, w3, strategy="edd")
-        sol = {"operations": build_operations(list(assignments.values()))}
-        best_assignments = repair_simple(
-            prob_info, assignments, bays, blocks_data,
-        )
+        edd_order = ALL_STRATEGIES["edd"](blocks_data)
+        best_assignments = fast_construct(edd_order)
+        best_assignments = repair_simple(prob_info, best_assignments, bays, blocks_data)
         best_objective = check_feasibility(
             prob_info, {"operations": build_operations(list(best_assignments.values()))}
         ).get("objective", float("inf"))
