@@ -5,7 +5,8 @@ import time
 from typing import Optional
 
 from utils import Bay, Block
-from construction.helpers import block_bbox
+from construction.helpers import block_bbox, find_earliest_slot, empty_bay_entry
+from construction.repair import _valid_x_range, _valid_y_range
 from improvement.local_search import (
     try_swap_blocks, try_move_block, try_rotate_block,
     try_time_shift, try_reassign_bay,
@@ -62,9 +63,70 @@ def refine_solution(
         old_obj = fast_objective(current, blocks_data, bays_data, weights_dict)["objective"]
 
         success = False
-        op_type = rng.choice(["swap", "move", "rotate"])
+        op_type = rng.choice(["time_shift", "reassign", "swap", "move", "rotate"])
 
-        if op_type == "swap":
+        if op_type == "time_shift":
+            a = current[bid_a]
+            blk_data = blocks_data[bid_a]
+            r_proc = blk_data["processing_time"]
+            r_time = blk_data["release_time"]
+            bay = bays[a["bay_id"]]
+            cand_blk = Block(
+                block_id=bid_a, block_data=blk_data,
+                x=a["x"], y=a["y"], orient_idx=a["orient_idx"],
+            )
+            slot = find_earliest_slot(
+                cand_blk, bay, bay_placed[a["bay_id"]],
+                bay_schedule[a["bay_id"]], r_time, r_proc,
+            )
+            if slot[0] is not None and slot[0] < a["entry_time"]:
+                success = try_time_shift(
+                    bid_a, slot[0], current, bay_placed,
+                    bay_schedule, bay_loads, blocks_data, bays,
+                )
+        elif op_type == "reassign":
+            a = current[bid_a]
+            blk_data = blocks_data[bid_a]
+            prefs = blk_data["bay_preferences"]
+            n_o = len(blk_data["shape"])
+            best_bay = None
+            best_oi = None
+            best_slot = None
+            for bj in sorted(range(n_bays), key=lambda j: prefs[j], reverse=True):
+                if bj == a["bay_id"]:
+                    continue
+                bay = bays[bj]
+                for oi in range(n_o):
+                    bb = block_bbox(blk_data, oi)
+                    bw = bb[2] - bb[0]
+                    bh = bb[3] - bb[1]
+                    if bw > bay.width + 1e-6 or bh > bay.height + 1e-6:
+                        continue
+                    xr = _valid_x_range(bay.width, bb)
+                    yr = _valid_y_range(bay.height, bb)
+                    if xr[0] > xr[1] or yr[0] > yr[1]:
+                        continue
+                    px = xr[0]
+                    py = yr[0]
+                    cand_blk = Block(block_id=bid_a, block_data=blk_data, x=px, y=py, orient_idx=oi)
+                    slot = find_earliest_slot(
+                        cand_blk, bay, bay_placed[bj],
+                        bay_schedule[bj], blk_data["release_time"],
+                        blk_data["processing_time"],
+                    )
+                    if slot[0] is not None:
+                        if best_slot is None or slot[0] < best_slot[0]:
+                            best_slot = (slot[0], slot[1])
+                            best_bay = bj
+                            best_oi = oi
+                            best_x, best_y = px, py
+            if best_bay is not None:
+                success = try_reassign_bay(
+                    bid_a, best_bay, best_x, best_y, best_oi,
+                    best_slot[0], current, bay_placed,
+                    bay_schedule, bay_loads, blocks_data, bays,
+                )
+        elif op_type == "swap":
             success = try_swap_blocks(
                 bid_a, bid_b, current, bay_placed, bay_schedule, bay_loads,
                 blocks_data, bays,

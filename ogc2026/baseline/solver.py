@@ -7,9 +7,11 @@ from typing import Optional
 from utils import Bay, Block, check_feasibility, check_entry, check_exit, check_collisions
 from config import Config
 from construction.strategies import ALL_STRATEGIES
-from construction.helpers import build_operations, empty_bay_entry, block_bbox
-from construction.repair import repair_simple, _valid_x_range, _valid_y_range
+from construction.helpers import build_operations, empty_bay_entry, block_bbox, find_earliest_slot
+from construction.repair import repair_simple, _valid_x_range, _valid_y_range, _candidate_positions
+from core.objective import fast_objective
 from improvement.parallel import run_parallel_lns, run_multi_start_lns
+from improvement.refine import refine_solution
 
 def refine_positions(
     assignments: dict[int, dict],
@@ -106,6 +108,134 @@ def refine_positions(
                 "x": px, "y": py, "orient_idx": oi,
                 "entry_time": int(old_entry), "exit_time": int(old_exit),
             }
+
+    return current
+
+
+def refine_timing(
+    assignments: dict[int, dict],
+    prob_info: dict,
+    bays: list[Bay],
+    blocks_data: list[dict],
+    w1: float, w2: float, w3: float,
+    t_start: float,
+    timelimit: float = 5.0,
+) -> dict[int, dict]:
+    n_bays = len(bays)
+    bay_placed: list[list[Block]] = [[] for _ in range(n_bays)]
+    bay_sched: list[list[tuple[int, int]]] = [[] for _ in range(n_bays)]
+
+    for a in assignments.values():
+        bid = a["block_id"]
+        bay_id = a["bay_id"]
+        bay_placed[bay_id].append(Block(
+            block_id=bid, block_data=blocks_data[bid],
+            x=int(a["x"]), y=int(a["y"]), orient_idx=a["orient_idx"],
+        ))
+        bay_sched[bay_id].append((a["entry_time"], a["exit_time"]))
+
+    current = {bid: dict(a) for bid, a in assignments.items()}
+
+    bbox_cache: dict[tuple[int, int], tuple] = {}
+    for bid, blk in enumerate(blocks_data):
+        for oi in range(len(blk["shape"])):
+            bbox_cache[(bid, oi)] = block_bbox(blk, oi)
+
+    for _pass in range(20):
+        if time.time() - t_start >= timelimit:
+            break
+        improved = False
+
+        late = sorted(
+            [(bid, a) for bid, a in current.items()
+             if a["exit_time"] - blocks_data[bid]["due_date"] > 0],
+            key=lambda x: -(x[1]["exit_time"] - blocks_data[x[0]]["due_date"]),
+        )[:20]
+
+        for bid, old_a in late:
+            if time.time() - t_start >= timelimit:
+                break
+            old_bay_id = old_a["bay_id"]
+            for i, b in enumerate(bay_placed[old_bay_id]):
+                if b.block_id == bid:
+                    bay_placed[old_bay_id].pop(i)
+                    break
+            for i, (entry, et) in enumerate(bay_sched[old_bay_id]):
+                if entry == old_a["entry_time"] and et == old_a["exit_time"]:
+                    bay_sched[old_bay_id].pop(i)
+                    break
+
+            blk_data = blocks_data[bid]
+            prefs = blk_data["bay_preferences"]
+            r_time = blk_data["release_time"]
+            proc = blk_data["processing_time"]
+            old_tardy = old_a["exit_time"] - blk_data["due_date"]
+
+            best_fit = None
+            best_score = float("inf")
+            n_o = len(blk_data["shape"])
+
+            bay_order = sorted(range(n_bays), key=lambda j: prefs[j], reverse=True)
+            for bay_id in bay_order:
+                bay = bays[bay_id]
+                for oi in range(n_o):
+                    bb = bbox_cache[(bid, oi)]
+                    bw = bb[2] - bb[0]
+                    bh = bb[3] - bb[1]
+                    if bw > bay.width + 1e-6 or bh > bay.height + 1e-6:
+                        continue
+                    xr = _valid_x_range(bay.width, bb)
+                    yr = _valid_y_range(bay.height, bb)
+                    if xr[0] > xr[1] or yr[0] > yr[1]:
+                        continue
+                    candidates = _candidate_positions(xr, yr)
+                    for px, py in candidates:
+                        cand_blk = Block(block_id=bid, block_data=blk_data, x=px, y=py, orient_idx=oi)
+                        if not bay.contains_block(cand_blk):
+                            continue
+                        slot = find_earliest_slot(
+                            cand_blk, bay,
+                            bay_placed[bay_id], bay_sched[bay_id],
+                            r_time, proc,
+                        )
+                        if slot[0] is None:
+                            continue
+                        entry, exit_t = slot
+                        tardy = max(0, exit_t - blk_data["due_date"])
+                        pref_pen = max(prefs) - prefs[bay_id]
+                        score = tardy * w1 + pref_pen * w3
+                        if score < best_score:
+                            best_score = score
+                            best_fit = (bay_id, px, py, oi, entry, exit_t)
+                            if score == 0:
+                                break
+                    if best_fit is not None and best_score == 0:
+                        break
+                if best_fit is not None and best_score == 0:
+                    break
+
+            old_score = max(0, old_tardy) * w1 + (max(prefs) - prefs[old_bay_id]) * w3
+            if best_fit is not None:
+                bay_id, px, py, oi, entry, exit_t = best_fit
+                new_score = max(0, entry + proc - blk_data["due_date"]) * w1 + (max(prefs) - prefs[bay_id]) * w3
+                if new_score < old_score:
+                    new_blk = Block(block_id=bid, block_data=blk_data, x=px, y=py, orient_idx=oi)
+                    bay_placed[bay_id].append(new_blk)
+                    bay_sched[bay_id].append((entry, exit_t))
+                    current[bid] = {
+                        "block_id": bid, "bay_id": bay_id,
+                        "x": px, "y": py, "orient_idx": oi,
+                        "entry_time": entry, "exit_time": exit_t,
+                    }
+                    improved = True
+                    continue
+
+            restored_blk = Block(block_id=bid, block_data=blk_data, x=old_a["x"], y=old_a["y"], orient_idx=old_a["orient_idx"])
+            bay_placed[old_bay_id].append(restored_blk)
+            bay_sched[old_bay_id].append((old_a["entry_time"], old_a["exit_time"]))
+
+        if not improved:
+            break
 
     return current
 
@@ -237,6 +367,38 @@ def solve(prob_info: dict, timelimit: float = 60.0) -> dict:
 
     final_assignments = lns_result
     final_assignments = refine_positions(final_assignments, prob_info, bays)
+    refine_budget = max(2.0, min(10.0, lns_budget * 0.03))
+    final_assignments = refine_timing(
+        final_assignments, prob_info, bays, blocks_data, w1, w2, w3,
+        t_start, refine_budget,
+    )
+    # Neighborhood search (swap/move/rotate/time_shift/reassign)
+    n_bays = len(bays)
+    bay_placed_final = [[] for _ in range(n_bays)]
+    bay_sched_final = [[] for _ in range(n_bays)]
+    bay_loads_final = [0.0] * n_bays
+    for a in final_assignments.values():
+        bid = a["block_id"]
+        bay_id = a["bay_id"]
+        bay_placed_final[bay_id].append(Block(
+            block_id=bid, block_data=blocks_data[bid],
+            x=int(a["x"]), y=int(a["y"]), orient_idx=a["orient_idx"],
+        ))
+        bay_sched_final[bay_id].append((a["entry_time"], a["exit_time"]))
+        bay_loads_final[bay_id] += blocks_data[bid]["workload"]
+    weights_dict = prob_info.get("weights", {})
+    final_before_refine = {bid: dict(a) for bid, a in final_assignments.items()}
+    final_assignments = refine_solution(
+        final_assignments, blocks_data, bays,
+        bay_placed_final, bay_sched_final, bay_loads_final,
+        bays_data, weights_dict,
+        t_start, max(1.0, refine_budget * 0.5),
+        random.Random(999),
+    )
+    check_sol = {"operations": build_operations(list(final_assignments.values()))}
+    final_result = check_feasibility(prob_info, check_sol)
+    if not final_result.get("feasible", False):
+        final_assignments = final_before_refine
     final_sol = {"operations": build_operations(list(final_assignments.values()))}
     result = check_feasibility(prob_info, final_sol)
     elapsed = time.time() - t_start

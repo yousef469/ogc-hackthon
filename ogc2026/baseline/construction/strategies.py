@@ -1,5 +1,12 @@
 from __future__ import annotations
+import random as _random
 from typing import Callable
+
+_RNG = _random.Random(0)
+
+def _next_seed() -> int:
+    _RNG.seed(_RNG.randint(0, 2**31))
+    return _RNG.randint(0, 2**31)
 
 
 def by_edd(blocks_data: list[dict]) -> list[int]:
@@ -43,10 +50,17 @@ def by_weighted(blocks_data: list[dict]) -> list[int]:
     )
 
 
+def by_random(blocks_data: list[dict]) -> list[int]:
+    order = list(range(len(blocks_data)))
+    _random.Random(_next_seed()).shuffle(order)
+    return order
+
+
 ALL_STRATEGIES: dict[str, Callable[[list[dict]], list[int]]] = {
     "edd": by_edd,
     "est": by_est,
     "slack": by_slack,
     "spt": by_spt,
     "weighted": by_weighted,
+    "random": by_random,
 }

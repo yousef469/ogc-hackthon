@@ -35,6 +35,10 @@ def run_lns(
     bays_data = prob_info["bays"]
     weights_dict = prob_info.get("weights", {})
 
+    bay_areas = [b["width"] * b["height"] for b in bays_data]
+    avg_area = sum(bay_areas) / n_bays if n_bays else 1.0
+    bay_weights = [avg_area / max(a, 1) for a in bay_areas]
+
     bay_placed: list[list[Block]] = [[] for _ in range(n_bays)]
     bay_schedule: list[list[tuple[int, int]]] = [[] for _ in range(n_bays)]
     bay_loads: list[float] = [0.0] * n_bays
@@ -85,9 +89,14 @@ def run_lns(
     destroy_ratio_start = 0.25
     destroy_ratio_end = 0.08
     min_destroy = 5
-    rescue_interval = 5000
-    reheat_threshold = 20000
+    rescue_interval = max(50, int(timelimit * 5))
+    shake_interval = max(25, int(timelimit * 2.5))
+    last_shake_iter = 0
+    shake_min_gap = max(10, int(timelimit * 1))
+    reheat_threshold = max(200, int(timelimit * 20))
     reheat_count = 0
+    last_shake_iter = 0
+    shake_min_gap = 500
 
     def _remove_blocks(ids: list[int]) -> dict[int, dict]:
         saved = {}
@@ -131,6 +140,32 @@ def run_lns(
             k = max(min_destroy, int(n_blocks * 0.50))
             op_name, op_fn = "rescue_random", ALL_DESTROY_OPERATORS[0][1]
             to_remove = op_fn(current_assignments, blocks_data, k, rng)
+            do_shake = False
+        elif stale > shake_interval and n_iterations - last_shake_iter > shake_min_gap:
+            shake_prob = min(0.4, (stale - shake_interval) / max(rescue_interval - shake_interval, 1))
+            if rng.random() < shake_prob:
+                k = rng.randint(int(n_blocks * 0.40), int(n_blocks * 0.55))
+                tardy_bids = sorted(
+                    current_assignments.keys(),
+                    key=lambda b: -(current_assignments[b]["exit_time"] - blocks_data[b]["due_date"]),
+                )
+                n_tardy = max(k, min(k, len(tardy_bids)))
+                shake_ids = set(tardy_bids[:n_tardy])
+                remaining = [b for b in current_assignments if b not in shake_ids]
+                if remaining:
+                    shake_ids.update(rng.sample(remaining, min(k - n_tardy, len(remaining))))
+                to_remove = list(shake_ids)[:k]
+                op_name = "massive_shake"
+                last_shake_iter = n_iterations
+            else:
+                op_name, op_fn = rng.choice(ALL_DESTROY_OPERATORS)
+                to_remove = op_fn(current_assignments, blocks_data, k, rng)
+        elif stale > shake_interval * 0.5:
+            frac = (stale - shake_interval * 0.5) / max(rescue_interval - shake_interval * 0.5, 1)
+            adaptive_ratio = destroy_ratio + (0.50 - destroy_ratio) * min(frac, 1.0)
+            k = max(min_destroy, int(n_blocks * adaptive_ratio))
+            op_name, op_fn = rng.choice(ALL_DESTROY_OPERATORS)
+            to_remove = op_fn(current_assignments, blocks_data, k, rng)
         else:
             op_name, op_fn = rng.choice(ALL_DESTROY_OPERATORS)
             to_remove = op_fn(current_assignments, blocks_data, k, rng)
@@ -139,10 +174,17 @@ def run_lns(
 
         old_of_removed = _remove_blocks(to_remove)
 
-        destroyed_order = sorted(to_remove, key=lambda bi: (
-            blocks_data[bi]["due_date"],
-            blocks_data[bi]["processing_time"],
-        ))
+        is_shake = op_name == "massive_shake"
+        if is_shake:
+            destroyed_order = sorted(to_remove, key=lambda bi: (
+                blocks_data[bi]["due_date"],
+                blocks_data[bi]["processing_time"],
+            ))
+        else:
+            destroyed_order = sorted(to_remove, key=lambda bi: (
+                blocks_data[bi]["due_date"],
+                blocks_data[bi]["processing_time"],
+            ))
 
         explore_positions = rng.random() < 0.50
         stochastic_rebuild = rng.random() < 0.60
@@ -168,7 +210,8 @@ def run_lns(
             was_tardy = max(0, old_exit - blk_data["due_date"])
 
             bay_order = sorted(range(n_bays), key=lambda j: prefs[j], reverse=True)
-            if rng.random() < 0.20 and len(bay_order) > 1:
+            shuffle_bays = rng.random() < (0.80 if is_shake else 0.50)
+            if shuffle_bays and len(bay_order) > 1:
                 pick = rng.randint(1, len(bay_order) - 1)
                 bay_order[0], bay_order[pick] = bay_order[pick], bay_order[0]
             for bay_id in bay_order:
@@ -226,15 +269,23 @@ def run_lns(
                     entry = empty_bay_entry(bay_schedule[bay_id], r_time, proc)
                     if entry is not None:
                         exit_t = entry + proc
-                        # Position-aware timing for high-tardiness blocks (probabilistic, expensive)
-                        if n_iterations % 5 == 0 and was_tardy > 0 and bay_id == old_bay_id and oi == old_oi and (px, py) == (old_x, old_y):
+                        # Position-aware timing for high-tardiness blocks (geometry-aware, expensive)
+                        if was_tardy > 0 and bay_id == old_bay_id and oi == old_oi and (px, py) == (old_x, old_y):
                             cand_blk = Block(block_id=bid, block_data=blk_data, x=old_x, y=old_y, orient_idx=old_oi)
                             slot = find_earliest_slot(cand_blk, bay, bay_placed[bay_id], bay_schedule[bay_id], r_time, proc)
                             if slot[0] is not None and slot[0] < entry:
                                 entry, exit_t = slot
                         tardy = max(0, exit_t - blk_data["due_date"])
                         pref_penalty = max(prefs) - prefs[bay_id]
-                        score = tardy * w1 + pref_penalty * w3
+                        workload = blk_data["workload"]
+                        imbalance_delta = 0.0
+                        if n_bays > 1 and w2 > 0:
+                            old_weighted = [bay_weights[j] * bay_loads[j] for j in range(n_bays)]
+                            old_imb = max(old_weighted) - min(old_weighted)
+                            new_weighted = [bay_weights[j] * (bay_loads[j] + (workload if j == bay_id else 0.0)) for j in range(n_bays)]
+                            new_imb = max(new_weighted) - min(new_weighted)
+                            imbalance_delta = new_imb - old_imb
+                        score = tardy * w1 + imbalance_delta * w2 + pref_penalty * w3
                         fit = (bay_id, px, py, oi, int(entry), int(exit_t))
                         all_options.append((score, fit))
                         if score < best_score:
@@ -356,7 +407,10 @@ def run_lns(
             _restore_blocks(old_of_removed)
             current_obj = fast_objective(current_assignments, blocks_data, bays_data, weights_dict)["objective"]
 
-        if stale > reheat_threshold and reheat_count < 3:
+        if is_shake:
+            sa.temperature = sa.initial_temp
+            stale = 0
+        elif stale > reheat_threshold and reheat_count < 3:
             sa.temperature = sa.initial_temp * 0.3
             reheat_count += 1
             stale = 0

@@ -72,6 +72,22 @@ def bay_removal(
     return rng.sample(candidates, min(k, len(candidates)))
 
 
+def cross_bay_removal(
+    assignments: dict,
+    blocks_data: list[dict],
+    k: int,
+    rng: random.Random,
+) -> list[int]:
+    by_bay: dict[int, list[int]] = {}
+    for bid, a in assignments.items():
+        by_bay.setdefault(a["bay_id"], []).append(bid)
+    if len(by_bay) < 2:
+        return random_removal(assignments, blocks_data, k, rng)
+    bay_a, bay_b = rng.sample(list(by_bay.keys()), 2)
+    candidates = by_bay[bay_a] + by_bay[bay_b]
+    return rng.sample(candidates, min(k, len(candidates)))
+
+
 def time_window_removal(
     assignments: dict,
     blocks_data: list[dict],
@@ -103,5 +119,6 @@ ALL_DESTROY_OPERATORS = [
     ("worst", worst_removal),
     ("related", related_removal),
     ("bay", bay_removal),
+    ("cross_bay", cross_bay_removal),
     ("time_window", time_window_removal),
 ]
