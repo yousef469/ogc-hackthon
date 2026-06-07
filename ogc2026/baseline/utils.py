@@ -374,13 +374,21 @@ class Block:
 
         Fallback: if the block has no layers (degenerate shape), returns a
         1*1 bounding box anchored at (x, y) so that AABB tests still work.
+
+        Cached on first call since Block is immutable after construction.
         """
+        cache = getattr(self, '_bounding_rect_cache', None)
+        if cache is not None:
+            return cache
         layers = self.layers_at_pos()
         if not layers:
-            return (float(self.x), float(self.y),
-                    float(self.x) + 1.0, float(self.y) + 1.0)
-        all_verts = [v for layer in layers for v in layer]
-        return _bounding_box(all_verts)
+            result = (float(self.x), float(self.y),
+                      float(self.x) + 1.0, float(self.y) + 1.0)
+        else:
+            all_verts = [v for layer in layers for v in layer]
+            result = _bounding_box(all_verts)
+        object.__setattr__(self, '_bounding_rect_cache', result)
+        return result
 
     # -- Convenience methods --------------------------------------------------
     @classmethod

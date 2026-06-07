@@ -3,12 +3,17 @@ import math
 import random
 import time
 
-from utils import Bay, Block, check_feasibility
+from utils import Bay, Block, check_feasibility, check_entry, check_exit, check_collisions
 from config import Config
-from construction.helpers import build_operations, block_bbox, empty_bay_entry
+from construction.helpers import build_operations, block_bbox, empty_bay_entry, find_earliest_slot
 from construction.repair import _valid_x_range, _valid_y_range, _candidate_positions
+from improvement.destroy import ALL_DESTROY_OPERATORS
 from improvement.acceptance import SimulatedAnnealing
 from core.objective import fast_objective
+
+
+def _aabb_overlap(a: tuple, b: tuple) -> bool:
+    return a[0] < b[2] and a[2] > b[0] and a[1] < b[3] and a[3] > b[1]
 
 
 def run_lns(
@@ -34,6 +39,11 @@ def run_lns(
     bay_schedule: list[list[tuple[int, int]]] = [[] for _ in range(n_bays)]
     bay_loads: list[float] = [0.0] * n_bays
 
+    bbox_cache: dict[tuple[int, int], tuple[float, float, float, float]] = {}
+    for bid, blk in enumerate(blocks_data):
+        for oi in range(len(blk["shape"])):
+            bbox_cache[(bid, oi)] = block_bbox(blk, oi)
+
     for a in initial_assignments.values():
         bid = a["block_id"]
         bay_id = a["bay_id"]
@@ -55,6 +65,7 @@ def run_lns(
         initial_temp=config.sa_initial_temperature,
         cooling_rate=config.sa_cooling_rate,
     )
+    cooling_power = config.sa_cooling_power
 
     if verbose:
         print(f"[LNS] seed={seed}  initial={current_obj:.0f}  "
@@ -66,103 +77,204 @@ def run_lns(
     n_accepted = 0
     n_improved = 0
     stale = 0
-    max_stale = 5000
+    max_stale = max(100000, int(timelimit * 2000))
     deadline = time.time() + timelimit
-    log_interval = max(500, 2000 // (config.num_workers if config.use_parallel else 1))
-    full_check_interval = 200
+    log_interval = max(100, 500 // (config.num_workers if config.use_parallel else 1))
+    full_check_interval = 50
+
+    destroy_ratio_start = 0.25
+    destroy_ratio_end = 0.08
+    min_destroy = 5
+    rescue_interval = 5000
+    reheat_threshold = 20000
+    reheat_count = 0
+
+    def _remove_blocks(ids: list[int]) -> dict[int, dict]:
+        saved = {}
+        for bid in ids:
+            saved[bid] = dict(current_assignments[bid])
+            a = saved[bid]
+            bay_id = a["bay_id"]
+            for i, b in enumerate(bay_placed[bay_id]):
+                if b.block_id == bid:
+                    bay_placed[bay_id].pop(i)
+                    break
+            for i, (entry, et) in enumerate(bay_schedule[bay_id]):
+                if entry == a["entry_time"] and et == a["exit_time"]:
+                    bay_schedule[bay_id].pop(i)
+                    break
+            bay_loads[bay_id] -= blocks_data[bid]["workload"]
+            del current_assignments[bid]
+        return saved
+
+    def _restore_blocks(saved: dict[int, dict]):
+        for bid, a in saved.items():
+            bay_id = a["bay_id"]
+            blk = Block(
+                block_id=bid, block_data=blocks_data[bid],
+                x=int(a["x"]), y=int(a["y"]), orient_idx=a["orient_idx"],
+            )
+            bay_placed[bay_id].append(blk)
+            bay_schedule[bay_id].append((a["entry_time"], a["exit_time"]))
+            bay_loads[bay_id] += blocks_data[bid]["workload"]
+            current_assignments[bid] = dict(a)
 
     while time.time() < deadline and stale < max_stale:
         n_iterations += 1
         stale += 1
 
-        bid = rng.choice(list(current_assignments.keys()))
-        a = current_assignments[bid]
-        old_bay = a["bay_id"]
-        blk_data = blocks_data[bid]
-        r_time = blk_data["release_time"]
-        proc = blk_data["processing_time"]
-        prefs = blk_data["bay_preferences"]
+        progress = min(1.0, (time.time() - lns_start) / max(timelimit, 0.1))
+        destroy_ratio = destroy_ratio_start + (destroy_ratio_end - destroy_ratio_start) * progress
+        k = max(min_destroy, int(n_blocks * destroy_ratio))
 
-        for i, b in enumerate(bay_placed[old_bay]):
-            if b.block_id == bid:
-                bay_placed[old_bay].pop(i)
-                break
-        for i, (entry, et) in enumerate(bay_schedule[old_bay]):
-            if entry == a["entry_time"] and et == a["exit_time"]:
-                bay_schedule[old_bay].pop(i)
-                break
-        bay_loads[old_bay] -= blk_data["workload"]
-
-        best_fit = None
-        best_score = float("inf")
-        bay_order = sorted(range(n_bays), key=lambda j: prefs[j], reverse=True)
-        orig_x = a.get("x", 0)
-        orig_y = a.get("y", 0)
-        orig_oi = a.get("orient_idx", 0)
-
-        explore = rng.random() < 0.15
-        if not explore:
-            for bay_id in bay_order:
-                bay = bays[bay_id]
-                bb = block_bbox(blk_data, orig_oi)
-                bw = bb[2] - bb[0]
-                bh = bb[3] - bb[1]
-                if bw > bay.width + 1e-6 or bh > bay.height + 1e-6:
-                    continue
-                if bay_id != old_bay:
-                    if orig_x + bw > bay.width + 1e-6 or orig_y + bh > bay.height + 1e-6:
-                        continue
-                entry = empty_bay_entry(bay_schedule[bay_id], r_time, proc)
-                if entry is not None:
-                    tardy = max(0, entry + proc - blk_data["due_date"])
-                    pref_penalty = max(prefs) - prefs[bay_id]
-                    score = tardy * w1 + pref_penalty * w3
-                    if score < best_score:
-                        best_score = score
-                        best_fit = (bay_id, orig_x, orig_y, orig_oi, entry, entry + proc)
-                        if score == 0:
-                            break
+        if stale > rescue_interval:
+            k = max(min_destroy, int(n_blocks * 0.50))
+            op_name, op_fn = "rescue_random", ALL_DESTROY_OPERATORS[0][1]
+            to_remove = op_fn(current_assignments, blocks_data, k, rng)
         else:
+            op_name, op_fn = rng.choice(ALL_DESTROY_OPERATORS)
+            to_remove = op_fn(current_assignments, blocks_data, k, rng)
+        if len(to_remove) < 1:
+            continue
+
+        old_of_removed = _remove_blocks(to_remove)
+
+        destroyed_order = sorted(to_remove, key=lambda bi: (
+            blocks_data[bi]["due_date"],
+            blocks_data[bi]["processing_time"],
+        ))
+
+        explore_positions = rng.random() < 0.50
+        stochastic_rebuild = rng.random() < 0.60
+
+        for bid in destroyed_order:
+            blk_data = blocks_data[bid]
+            old_a = old_of_removed[bid]
+            r_time = blk_data["release_time"]
+            proc = blk_data["processing_time"]
+            prefs = blk_data["bay_preferences"]
+            n_o = len(blk_data["shape"])
+
+            best_fit = None
+            best_score = float("inf")
+            all_options: list[tuple[float, tuple]] = []
+
+            old_bay_id = old_a["bay_id"]
+            old_x = int(old_a["x"])
+            old_y = int(old_a["y"])
+            old_oi = old_a["orient_idx"]
+            old_entry = old_a["entry_time"]
+            old_exit = old_a["exit_time"]
+            was_tardy = max(0, old_exit - blk_data["due_date"])
+
+            bay_order = sorted(range(n_bays), key=lambda j: prefs[j], reverse=True)
+            if rng.random() < 0.20 and len(bay_order) > 1:
+                pick = rng.randint(1, len(bay_order) - 1)
+                bay_order[0], bay_order[pick] = bay_order[pick], bay_order[0]
             for bay_id in bay_order:
                 bay = bays[bay_id]
-                for oi in range(len(blk_data["shape"])):
-                    bb = block_bbox(blk_data, oi)
-                    xr = _valid_x_range(bay.width, bb)
-                    yr = _valid_y_range(bay.height, bb)
-                    if xr[0] > xr[1] or yr[0] > yr[1]:
+                if bay_id == old_bay_id:
+                    oi_list = [old_oi]
+                else:
+                    oi_list = sorted(
+                        range(n_o),
+                        key=lambda oi_: (
+                            bbox_cache[(bid, oi_)][2] - bbox_cache[(bid, oi_)][0]
+                        ) * (bbox_cache[(bid, oi_)][3] - bbox_cache[(bid, oi_)][1])
+                    )
+                for oi in oi_list:
+                    bb = bbox_cache[(bid, oi)]
+                    bw = bb[2] - bb[0]
+                    bh = bb[3] - bb[1]
+                    if bw > bay.width + 1e-6 or bh > bay.height + 1e-6:
                         continue
-                    px = rng.randint(xr[0], xr[1])
-                    py = rng.randint(yr[0], yr[1])
+                    if bay_id == old_bay_id and oi == old_oi:
+                        px, py = old_x, old_y
+                    elif explore_positions:
+                        xr = _valid_x_range(bay.width, bb)
+                        yr = _valid_y_range(bay.height, bb)
+                        if xr[0] > xr[1] or yr[0] > yr[1]:
+                            continue
+                        for _ in range(5):
+                            px = rng.randint(xr[0], xr[1])
+                            py = rng.randint(yr[0], yr[1])
+                            new_blk = Block(block_id=bid, block_data=blk_data, x=px, y=py, orient_idx=oi)
+                            nbr = new_blk.bounding_rect()
+                            if not any(
+                                _aabb_overlap(nbr, b.bounding_rect())
+                                for b in bay_placed[bay_id]
+                            ):
+                                break
+                        else:
+                            xr = _valid_x_range(bay.width, bb)
+                            yr = _valid_y_range(bay.height, bb)
+                            if xr[0] > xr[1] or yr[0] > yr[1]:
+                                continue
+                            candidates = _candidate_positions(xr, yr)
+                            px, py = candidates[0]
+                            if px + bw > bay.width + 1e-6 or py + bh > bay.height + 1e-6:
+                                continue
+                    else:
+                        xr = _valid_x_range(bay.width, bb)
+                        yr = _valid_y_range(bay.height, bb)
+                        if xr[0] > xr[1] or yr[0] > yr[1]:
+                            continue
+                        candidates = _candidate_positions(xr, yr)
+                        px, py = candidates[0]
+                        if px + bw > bay.width + 1e-6 or py + bh > bay.height + 1e-6:
+                            continue
                     entry = empty_bay_entry(bay_schedule[bay_id], r_time, proc)
                     if entry is not None:
-                        tardy = max(0, entry + proc - blk_data["due_date"])
+                        exit_t = entry + proc
+                        # Position-aware timing for high-tardiness blocks (probabilistic, expensive)
+                        if n_iterations % 5 == 0 and was_tardy > 0 and bay_id == old_bay_id and oi == old_oi and (px, py) == (old_x, old_y):
+                            cand_blk = Block(block_id=bid, block_data=blk_data, x=old_x, y=old_y, orient_idx=old_oi)
+                            slot = find_earliest_slot(cand_blk, bay, bay_placed[bay_id], bay_schedule[bay_id], r_time, proc)
+                            if slot[0] is not None and slot[0] < entry:
+                                entry, exit_t = slot
+                        tardy = max(0, exit_t - blk_data["due_date"])
                         pref_penalty = max(prefs) - prefs[bay_id]
                         score = tardy * w1 + pref_penalty * w3
+                        fit = (bay_id, px, py, oi, int(entry), int(exit_t))
+                        all_options.append((score, fit))
                         if score < best_score:
                             best_score = score
-                            best_fit = (bay_id, px, py, oi, entry, entry + proc)
+                            best_fit = fit
                             if score == 0:
                                 break
                 if best_fit and best_score == 0:
                     break
 
-        if best_fit is None:
-            best_fit = (old_bay, a.get("x", 0), a.get("y", 0),
-                        a.get("orient_idx", 0), a["entry_time"], a["exit_time"])
+            if best_fit is None:
+                bj = max(range(n_bays), key=lambda j: prefs[j])
+                bay = bays[bj]
+                bb = bbox_cache[(bid, 0)]
+                xr = _valid_x_range(bay.width, bb)
+                yr = _valid_y_range(bay.height, bb)
+                px = max(0, xr[0]) if xr[0] <= xr[1] else 0
+                py = max(0, yr[0]) if yr[0] <= yr[1] else 0
+                entry = empty_bay_entry(bay_schedule[bj], r_time, proc)
+                best_fit = (bj, px, py, 0, int(entry), int(entry + proc))
 
-        bay_id, cx, cy, oi, entry, exit_t = best_fit
-        blk = Block(
-            block_id=bid, block_data=blk_data,
-            x=cx, y=cy, orient_idx=oi,
-        )
-        bay_placed[bay_id].append(blk)
-        bay_schedule[bay_id].append((entry, exit_t))
-        bay_loads[bay_id] += blk_data["workload"]
-        current_assignments[bid] = {
-            "block_id": bid, "bay_id": bay_id,
-            "x": cx, "y": cy, "orient_idx": oi,
-            "entry_time": int(entry), "exit_time": int(exit_t),
-        }
+            if stochastic_rebuild and len(all_options) > 1:
+                all_options.sort(key=lambda x: x[0])
+                top_k = min(3, len(all_options))
+                if rng.random() < 0.5:
+                    best_fit = rng.choice(all_options[:top_k])[1]
+
+            bay_id, cx, cy, oi, entry, exit_t = best_fit
+            blk = Block(
+                block_id=bid, block_data=blk_data,
+                x=cx, y=cy, orient_idx=oi,
+            )
+            bay_placed[bay_id].append(blk)
+            bay_schedule[bay_id].append((entry, exit_t))
+            bay_loads[bay_id] += blk_data["workload"]
+            current_assignments[bid] = {
+                "block_id": bid, "bay_id": bay_id,
+                "x": cx, "y": cy, "orient_idx": oi,
+                "entry_time": entry, "exit_time": exit_t,
+            }
 
         new_obj = fast_objective(current_assignments, blocks_data, bays_data, weights_dict)["objective"]
 
@@ -170,14 +282,23 @@ def run_lns(
             check_sol = {"operations": build_operations(list(current_assignments.values()))}
             full_result = check_feasibility(prob_info, check_sol)
             if not full_result["feasible"]:
-                current_assignments.clear()
-                for bid_, a_ in best_assignments.items():
-                    current_assignments[bid_] = dict(a_)
-                new_obj = best_obj
-            else:
-                full_obj = full_result.get("objective", new_obj)
-                if abs(full_obj - new_obj) > 1.0:
-                    new_obj = full_obj
+                for bid in to_remove:
+                    a_new = current_assignments[bid]
+                    bay_id = a_new["bay_id"]
+                    for i, b in enumerate(bay_placed[bay_id]):
+                        if b.block_id == bid:
+                            bay_placed[bay_id].pop(i)
+                            break
+                    for i, (entry, et) in enumerate(bay_schedule[bay_id]):
+                        if entry == a_new["entry_time"] and et == a_new["exit_time"]:
+                            bay_schedule[bay_id].pop(i)
+                            break
+                    bay_loads[bay_id] -= blocks_data[bid]["workload"]
+                    del current_assignments[bid]
+                _restore_blocks(old_of_removed)
+                old_of_removed.clear()
+                current_obj = fast_objective(current_assignments, blocks_data, bays_data, weights_dict)["objective"]
+                continue
 
         accepted = sa.accept(
             current_obj if current_obj != float("inf") else 0,
@@ -186,11 +307,11 @@ def run_lns(
 
         if accepted:
             n_accepted += 1
-            current_obj = new_obj
             if new_obj < best_obj:
                 check_sol = {"operations": build_operations(list(current_assignments.values()))}
                 full_result = check_feasibility(prob_info, check_sol)
                 if full_result.get("feasible", False):
+                    current_obj = new_obj
                     best_obj = new_obj
                     best_assignments = {
                         bid_: dict(a_) for bid_, a_ in current_assignments.items()
@@ -202,36 +323,54 @@ def run_lns(
                         print(f"[LNS] seed={seed}  iter={n_iterations}  "
                               f"best={best_obj:.0f}  "
                               f"elapsed={elapsed:.1f}s")
+                else:
+                    for bid in to_remove:
+                        a_new = current_assignments[bid]
+                        bay_id = a_new["bay_id"]
+                        for i, b in enumerate(bay_placed[bay_id]):
+                            if b.block_id == bid:
+                                bay_placed[bay_id].pop(i)
+                                break
+                        for i, (entry, et) in enumerate(bay_schedule[bay_id]):
+                            if entry == a_new["entry_time"] and et == a_new["exit_time"]:
+                                bay_schedule[bay_id].pop(i)
+                                break
+                        bay_loads[bay_id] -= blocks_data[bid]["workload"]
+                    _restore_blocks(old_of_removed)
+                    current_obj = fast_objective(current_assignments, blocks_data, bays_data, weights_dict)["objective"]
+            else:
+                current_obj = new_obj
         else:
-            current_assignments.clear()
-            for bid_, a_ in best_assignments.items():
-                current_assignments[bid_] = dict(a_)
-            current_obj = best_obj
+            for bid in to_remove:
+                a_new = current_assignments[bid]
+                bay_id = a_new["bay_id"]
+                for i, b in enumerate(bay_placed[bay_id]):
+                    if b.block_id == bid:
+                        bay_placed[bay_id].pop(i)
+                        break
+                for i, (entry, et) in enumerate(bay_schedule[bay_id]):
+                    if entry == a_new["entry_time"] and et == a_new["exit_time"]:
+                        bay_schedule[bay_id].pop(i)
+                        break
+                bay_loads[bay_id] -= blocks_data[bid]["workload"]
+            _restore_blocks(old_of_removed)
+            current_obj = fast_objective(current_assignments, blocks_data, bays_data, weights_dict)["objective"]
 
-            bay_placed.clear()
-            bay_placed.extend([] for _ in range(n_bays))
-            bay_schedule.clear()
-            bay_schedule.extend([] for _ in range(n_bays))
-            bay_loads[:] = [0.0] * n_bays
-
-            for bid_, a_ in best_assignments.items():
-                bay_id_ = a_["bay_id"]
-                blk_ = Block(
-                    block_id=bid_, block_data=blocks_data[bid_],
-                    x=int(a_["x"]), y=int(a_["y"]),
-                    orient_idx=a_["orient_idx"],
-                )
-                bay_placed[bay_id_].append(blk_)
-                bay_schedule[bay_id_].append((a_["entry_time"], a_["exit_time"]))
-                bay_loads[bay_id_] += blocks_data[bid_]["workload"]
-
-        sa.cool()
+        if stale > reheat_threshold and reheat_count < 3:
+            sa.temperature = sa.initial_temp * 0.3
+            reheat_count += 1
+            stale = 0
+        else:
+            elapsed_frac = (time.time() - lns_start) / max(timelimit, 0.1)
+            sa.temperature = sa.initial_temp * max(1e-6, (1.0 - elapsed_frac) ** cooling_power)
 
         if n_iterations % log_interval == 0 and verbose:
             elapsed = time.time() - lns_start
+            reheat_tag = " REHEAT" if stale == 0 and reheat_count > 0 and n_iterations % log_interval < 5 else ""
             print(f"[LNS] seed={seed}  iter={n_iterations}  "
                   f"current={current_obj:.0f}  best={best_obj:.0f}  "
-                  f"temp={sa.temperature:.1f}  stale={stale}  elapsed={elapsed:.1f}s")
+                  f"temp={sa.temperature:.1f}  stale={stale}  "
+                  f"destroy={op_name} k={len(to_remove)}  elapsed={elapsed:.1f}s{reheat_tag}")
 
     if verbose:
         elapsed = time.time() - lns_start
