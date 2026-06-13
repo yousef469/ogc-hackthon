@@ -11,7 +11,7 @@ from construction.helpers import build_operations, empty_bay_entry, block_bbox, 
 from construction.repair import repair_simple, _valid_x_range, _valid_y_range, _candidate_positions
 from core.objective import fast_objective
 from improvement.parallel import run_parallel_lns, run_multi_start_lns
-from improvement.refine import refine_solution
+from improvement.refine import refine_solution, escape_tardiness
 
 def refine_positions(
     assignments: dict[int, dict],
@@ -348,29 +348,37 @@ def solve(prob_info: dict, timelimit: float = 60.0) -> dict:
         ).get("objective", float("inf"))
         feasible_starts = [("edd_fallback", best_assignments)]
 
-    lns_time_remaining = max(1.0, timelimit - (time.time() - t_start) - 1.0)
-    lns_budget = lns_time_remaining * 0.95
+    lns_time_remaining = max(2.0, timelimit - (time.time() - t_start) - 1.0)
+    lns_budget = lns_time_remaining * 0.92
+    escape_budget = max(3.0, min(8.0, lns_time_remaining * 0.06))
 
     if timelimit >= 60.0:
         lns_result = run_multi_start_lns(
             prob_info, bays, blocks_data, w1, w2, w3,
-            best_assignments, t_start, lns_budget,
+            best_assignments, time.time(), lns_budget,
             config, verbose=True,
         )
     else:
         lns_result = run_parallel_lns(
             prob_info, bays, blocks_data, w1, w2, w3,
-            best_assignments, t_start, lns_budget,
+            best_assignments, time.time(), lns_budget,
             config, num_workers=min(config.num_workers, 2),
             verbose=True,
         )
 
     final_assignments = lns_result
+    lns_safe = {bid: dict(a) for bid, a in lns_result.items()}
+
     final_assignments = refine_positions(final_assignments, prob_info, bays)
-    refine_budget = max(2.0, min(10.0, lns_budget * 0.03))
+    refine_budget = max(3.0, min(15.0, lns_budget * 0.08))
     final_assignments = refine_timing(
         final_assignments, prob_info, bays, blocks_data, w1, w2, w3,
         t_start, refine_budget,
+    )
+    final_assignments = refine_positions(final_assignments, prob_info, bays)
+    final_assignments = refine_timing(
+        final_assignments, prob_info, bays, blocks_data, w1, w2, w3,
+        t_start, min(3.0, refine_budget * 0.3),
     )
     # Neighborhood search (swap/move/rotate/time_shift/reassign)
     n_bays = len(bays)

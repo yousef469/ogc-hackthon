@@ -104,6 +104,7 @@ def run_multi_start_lns(
 
     best_assignments = {bid: dict(a) for bid, a in initial_assignments.items()}
     best_obj = [float("inf")]
+    current_seed = [42]
     n_done = 0
 
     if verbose:
@@ -116,8 +117,10 @@ def run_multi_start_lns(
         max_workers=config.num_workers, mp_context=ctx,
     ) as pool:
         run_idx = 0
+        batch_count = 0
         while time.time() - t_start < timelimit - each_run * 1.1:
             batch = []
+            start_point = best_assignments if batch_count > 0 else initial_assignments
             for _ in range(config.num_workers):
                 if time.time() - t_start > timelimit - each_run * 1.1:
                     break
@@ -126,8 +129,10 @@ def run_multi_start_lns(
                 batch.append(pool.submit(
                     _lns_worker,
                     prob_info, bays, blocks_data, w1, w2, w3,
-                    initial_assignments, t_start, each_run, config, seed,
+                    start_point,
+                    t_start, each_run, config, seed,
                 ))
+            batch_count += 1
 
             for future in concurrent.futures.as_completed(batch):
                 try:

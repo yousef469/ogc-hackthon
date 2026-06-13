@@ -15,6 +15,9 @@ class Config:
         self.grid_cell_size: int = 20
         self.use_parallel: bool = True
 
+        self.beam_width: int = 8
+        self.beam_options_per_block: int = 3
+
         if prob_info is not None:
             self.auto_tune(prob_info)
 
@@ -22,12 +25,16 @@ class Config:
         weights = prob_info.get("weights", {})
         w1 = weights.get("w1", 1)
         n_blocks = len(prob_info.get("blocks", []))
+        n_bays = len(prob_info.get("bays", []))
 
         self.sa_initial_temperature = 50000.0 * w1 / 2667.0
         self.sa_cooling_rate = 0.99995
         self.sa_cooling_power = 3.0
         base_workers = min(4, max(2, n_blocks // 60 + 1))
         self.num_workers = min(4, base_workers)
+
+        self.beam_width = min(12, max(4, n_blocks // 30))
+        self.beam_options_per_block = min(5, max(2, n_bays))
 
     def get_construction_time(self, timelimit: float) -> float:
         return min(30.0, max(5.0, timelimit * 0.08))

@@ -4,8 +4,8 @@ import random
 import time
 from typing import Optional
 
-from utils import Bay, Block
-from construction.helpers import block_bbox, find_earliest_slot, empty_bay_entry
+from utils import Bay, Block, check_feasibility, check_entry, check_exit, check_collisions
+from construction.helpers import block_bbox, find_earliest_slot, empty_bay_entry, build_operations
 from construction.repair import _valid_x_range, _valid_y_range
 from improvement.local_search import (
     try_swap_blocks, try_move_block, try_rotate_block,
@@ -195,3 +195,97 @@ def refine_solution(
               f"elapsed={elapsed:.1f}s")
 
     return best
+
+
+def escape_tardiness(
+    assignments: dict[int, dict],
+    prob_info: dict,
+    bays: list[Bay],
+    blocks_data: list[dict],
+    w1: float,
+    t_start: float,
+    timelimit: float,
+    verbose: bool = False,
+) -> dict[int, dict]:
+    n_bays = len(bays)
+    bbox_cache: dict[tuple[int, int], tuple] = {}
+    for bid, blk in enumerate(blocks_data):
+        for oi in range(len(blk["shape"])):
+            bbox_cache[(bid, oi)] = block_bbox(blk, oi)
+
+    current = {bid: dict(a) for bid, a in assignments.items()}
+    deadline = time.time() + timelimit
+
+    for _pass in range(30):
+        if time.time() > deadline:
+            break
+
+        tardy = sorted(
+            [(bid, a) for bid, a in current.items()
+             if a["exit_time"] - blocks_data[bid]["due_date"] > 0],
+            key=lambda x: -(x[1]["exit_time"] - blocks_data[x[0]]["due_date"]),
+        )[:30]
+
+        if not tardy:
+            break
+
+        moves: list[tuple[int, int, int, int, int, int, int]] = []
+
+        for bid, old_a in tardy:
+            if time.time() > deadline:
+                break
+            blk_data = blocks_data[bid]
+            r_time = blk_data["release_time"]
+            proc = blk_data["processing_time"]
+            old_tardy = max(0, old_a["exit_time"] - blk_data["due_date"])
+            best_exit = float("inf")
+            best_move = None
+            n_o = len(blk_data["shape"])
+
+            for bay_id in range(n_bays):
+                bay = bays[bay_id]
+                for oi in range(n_o):
+                    bb = bbox_cache[(bid, oi)]
+                    bw = bb[2] - bb[0]
+                    bh = bb[3] - bb[1]
+                    if bw > bay.width + 1e-6 or bh > bay.height + 1e-6:
+                        continue
+                    xr = _valid_x_range(bay.width, bb)
+                    yr = _valid_y_range(bay.height, bb)
+                    if xr[0] > xr[1] or yr[0] > yr[1]:
+                        continue
+                    for px, py in [(xr[0], yr[0])]:
+                        if px + bw > bay.width + 1e-6 or py + bh > bay.height + 1e-6:
+                            continue
+                        cand = Block(block_id=bid, block_data=blk_data, x=px, y=py, orient_idx=oi)
+                        slot = find_earliest_slot(cand, bay, [], [], r_time, proc)
+                        if slot[0] is None:
+                            continue
+                        entry, exit_t = slot
+                        new_tardy = max(0, exit_t - blk_data["due_date"])
+                        if new_tardy < best_exit:
+                            best_exit = new_tardy
+                            best_move = (bid, bay_id, px, py, oi, entry, exit_t)
+                            if new_tardy == 0:
+                                break
+                if best_move and best_exit == 0:
+                    break
+
+            if best_move is not None and best_exit < old_tardy:
+                moves.append(best_move)
+
+        if not moves:
+            break
+
+        for bid, bay_id, px, py, oi, entry, exit_t in moves:
+            current[bid] = {
+                "block_id": bid, "bay_id": bay_id,
+                "x": px, "y": py, "orient_idx": oi,
+                "entry_time": entry, "exit_time": exit_t,
+            }
+
+    if verbose:
+        tardy_left = sum(1 for a in current.values() if a["exit_time"] - blocks_data[a["block_id"]]["due_date"] > 0)
+        print(f"[EscapeTardiness] {tardy_left} tardy blocks remaining")
+
+    return current
